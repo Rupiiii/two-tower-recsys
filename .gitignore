@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Data — raw is copyrighted (download separately), processed is reproducible
+data/raw/
+data/processed/
+
+# Trained model checkpoints — reproducible from src/train.py
+data/checkpoints/
+
+# Internal design doc — not for public repo
+claude_code_context.md
+
+# OS
+.DS_Store
