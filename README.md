@@ -144,7 +144,7 @@ python src/error_analysis.py         # Phase 6: cold-start, popularity, qualitat
 - **Per-user averaging** — Recall@K is averaged across users, not pooled
   globally. Pooled averaging would let heavy raters dominate the metric.
 
-### Phase 5 — Hard-negative mining ([src/mine_hard_negatives.py](src/mine_hard_negatives.py))
+### Phase 4 — Hard-negative mining ([src/mine_hard_negatives.py](src/mine_hard_negatives.py))
 
 **Motivation: popularity sampling bias.** When items appear as in-batch
 negatives proportional to their popularity `P(item)`, the converged model
@@ -175,7 +175,7 @@ contrastive matrix becomes `B × (B + N_hard)`; positives stay in columns
 the user**, not by frequency. This decouples the negative-sampling
 distribution from `P(item)`, neutralizing the implicit `/ P(item)` term.
 
-### Phase 6 — Error analysis ([src/error_analysis.py](src/error_analysis.py))
+### Phase 5 — Error analysis ([src/error_analysis.py](src/error_analysis.py))
 
 Three analyses are run against the final trained model:
 
