@@ -9,24 +9,6 @@ Built in PyTorch (Apple Silicon / MPS) and FAISS (CPU, flat index).
 
 ---
 
-## Headline results
-
-| metric        | random | popularity baseline | two-tower (in-batch) | **two-tower + hard negatives** |
-|---------------|-------:|--------------------:|---------------------:|-------------------------------:|
-| Recall@10     |  0.27% |               3.56% |                2.13% |                      **3.26%** |
-| Recall@50     |  1.35% |              13.35% |                9.64% |                     **13.22%** |
-| Recall@100    |  2.70% |              21.74% |               17.17% |                     **22.65%** |
-
-**Key finding:** the in-batch-negatives baseline initially *lost* to a
-popularity baseline (2.13% vs 3.56% Recall@10) — a textbook case of
-**popularity sampling bias** described in Yi et al. 2019 (the YouTube
-two-tower paper). Mining hard negatives from the model's own FAISS index
-and retraining with a 70/30 in-batch/hard mix lifted Recall@10 by **+53%**
-(2.13% → 3.26%) and Recall@100 by **+32%** (17.17% → 22.65%), letting the
-model beat the popularity baseline at K=100.
-
----
-
 ## Architecture
 
 ```
@@ -42,7 +24,8 @@ model beat the popularity baseline at K=100.
 ```
 
 Both towers output unit-norm vectors so the dot product is exactly cosine
-similarity, which is what FAISS's `IndexFlatIP` needs to do correct retrieval.
+similarity — which is what FAISS's `IndexFlatIP` needs to do correct
+retrieval.
 
 ### Model design choices
 
@@ -53,7 +36,7 @@ similarity, which is what FAISS's `IndexFlatIP` needs to do correct retrieval.
 | batch size               | 4096                                          | more in-batch negatives = stronger contrastive signal |
 | genre feature            | concatenated multi-hot vector, non-trainable  | fixed side feature for item cold-start |
 | L2-normalize             | both tower outputs                            | dot product = cosine; FAISS `IndexFlatIP` compatibility |
-| hard-neg mix             | 30% hard / 70% in-batch                       | per the Yi 2019 recipe                                                |
+| hard-neg mix             | 30% hard / 70% in-batch                       | per Yi et al. 2019 |
 
 ---
 
@@ -104,7 +87,7 @@ cd data/raw && curl -O https://files.grouplens.org/datasets/movielens/ml-1m.zip 
 ```bash
 python src/dataset.py                # build processed splits
 python src/train.py                  # train two-tower with in-batch negatives only
-python src/evaluate.py               # Recall@K baseline numbers
+python src/evaluate.py               # Recall@K baseline
 
 python src/mine_hard_negatives.py    # mine 30 hard negatives per user from FAISS
 python -c "from src.train import train; train(num_epochs=20, batch_size=4096, \
@@ -121,116 +104,95 @@ python src/error_analysis.py         # Phase 6: cold-start, popularity, qualitat
 
 ### Phase 1 — Data ([src/dataset.py](src/dataset.py))
 
-- Parses `ratings.dat` (1,000,209 interactions), `movies.dat` (3,883 movies).
+- Parses `ratings.dat` and `movies.dat` from the GroupLens ML-1M release.
 - Builds contiguous `user_id → idx` and `movie_id → idx` mappings (raw IDs
-  are non-contiguous; max movie ID is 3952 but only 3,706 movies were
-  actually rated).
-- Constructs an 18-genre multi-hot vector per item from the pipe-delimited
-  `genres` field (vocabulary discovered from data, not hardcoded).
-- **Per-user temporal 80/10/10 split** (sort each user's interactions by
-  timestamp, slice). Verified zero strict temporal violations across all
-  6,040 users; 130 boundary cases are same-second ties from MovieLens's
-  1-second timestamp resolution.
+  are non-contiguous in the source files).
+- Constructs a multi-hot genre vector per item from the pipe-delimited
+  `genres` field — vocabulary discovered from data, not hardcoded.
+- **Per-user temporal 80/10/10 split** — sort each user's interactions by
+  timestamp, slice. The script also verifies the split has zero strict
+  temporal violations across users (same-second timestamp ties are
+  reported separately as a known property of the MovieLens timestamp
+  resolution).
 
 > Random splits leak future data into training and inflate metrics. Temporal
-> split is non-negotiable for any honest recsys evaluation.
+> splitting per-user is non-negotiable for honest recsys evaluation, and
+> avoids the cold-user problem that a global temporal cut would create.
 
 ### Phase 2 — Two-Tower model ([src/model.py](src/model.py), [src/train.py](src/train.py))
 
-- `UserTower`: `nn.Embedding(num_users, 128) → Linear(128→256) → ReLU → Linear(256→128) → F.normalize`.
-- `ItemTower`: `[nn.Embedding(num_items, 128) ‖ genre_vec(18)] → Linear(146→256) → ReLU → Linear(256→128) → F.normalize`.
-- Genre vector registered as a non-trainable buffer, moves with the model.
-- Training: in-batch negatives over a `B × B` similarity matrix (`B=4096`).
-- Loss: InfoNCE / NT-Xent with τ = 0.07 — equivalent to `F.cross_entropy(logits, arange(B))`.
-- Optimizer: Adam, lr=1e-3, weight_decay=1e-5, 20 epochs, best-val checkpoint.
-
-Final in-batch baseline: **train loss 7.55 / val loss 8.21 (random baseline at B=4096 is `ln 4096 ≈ 8.32`)**.
+- `UserTower`: `nn.Embedding(num_users, D) → Linear(D→2D) → ReLU → Linear(2D→D) → F.normalize`.
+- `ItemTower`: `[nn.Embedding(num_items, D) ‖ genre_vec(G)] → Linear(D+G→2D) → ReLU → Linear(2D→D) → F.normalize`.
+- The genre matrix is registered as a non-trainable `buffer` — it moves with
+  the model to device and isn't updated by the optimizer.
+- Training: in-batch negatives over a `B × B` similarity matrix. The
+  diagonal is positives; off-diagonal entries are the `B-1` negatives per
+  row, contributed for free by the rest of the batch.
+- Loss: InfoNCE / NT-Xent with temperature `τ`. Equivalent to
+  `F.cross_entropy((u @ v.T) / τ, arange(B))`.
+- Best-val checkpoint is saved per epoch.
 
 ### Phase 3 — FAISS retrieval + Recall@K ([src/index.py](src/index.py), [src/evaluate.py](src/evaluate.py))
 
-- Run every item through `ItemTower`, build `faiss.IndexFlatIP` (exact inner
-  product; trivial for 3,706 items).
-- For each test user, retrieve top-N from FAISS, **exclude training
-  positives**, count overlap with their test items.
-- **Per-user averaging** of Recall@K (not pooled globally — heavy raters
-  would otherwise dominate the metric).
-
-Result: **Recall@10 = 2.13%** with the tuned in-batch model.
+- Run every item through `ItemTower` to get the item-embedding matrix.
+- Build `faiss.IndexFlatIP` (exact inner-product search). Catalogs of a few
+  thousand items don't need approximate methods; for production-scale
+  catalogs you'd swap in `IndexIVF` or HNSW.
+- For each test user, retrieve top-N from FAISS, **filter out items the
+  user already saw in training**, count overlap with their held-out test
+  items to compute Recall@K.
+- **Per-user averaging** — Recall@K is averaged across users, not pooled
+  globally. Pooled averaging would let heavy raters dominate the metric.
 
 ### Phase 5 — Hard-negative mining ([src/mine_hard_negatives.py](src/mine_hard_negatives.py))
 
-**Motivation**: The popularity baseline beats the in-batch baseline at K=10
-(3.56% vs 2.13%) — a known failure mode of in-batch contrastive training
-called *popularity sampling bias* (Yi et al. 2019, "Sampling-Bias-Corrected
-Neural Modeling for Large Corpus Item Recommendations").
+**Motivation: popularity sampling bias.** When items appear as in-batch
+negatives proportional to their popularity `P(item)`, the converged model
+implicitly estimates `P(item | user) / P(item)` rather than `P(item | user)`.
+The `/ P(item)` term subtracts popularity from every score, so popular
+items get systematically under-recommended. Yi et al. 2019 derive this for
+the YouTube two-tower model.
 
-The math: when items appear as in-batch negatives proportional to their
-popularity `P(item)`, the converged model estimates `P(item | user) / P(item)`
-rather than `P(item | user)`. The `/ P(item)` term subtracts popularity from
-every score, so popular items get systematically under-recommended.
+A simple diagnostic — comparing the in-batch baseline against "just
+recommend the K most-rated items in train" — exposes the bias directly,
+and motivates the Phase 5 fix.
 
-**Mining recipe** (per the project spec):
-- Use the in-batch baseline to build a FAISS index.
-- For each user, query top-50, drop their training positives → keep up to 30
-  hard negatives per user. Result: `[6040, 30]` int64 matrix.
-- 5/6040 users had < 10 distinct hard negs (very heavy raters whose train
-  history consumed most of the top-50); padded with duplicates. <1% bias.
+**Mining recipe**:
+- Use the baseline model to build a FAISS index.
+- For each user, query top-50, drop their training positives, keep up to 30
+  hard negatives. Result: a `[num_users, 30]` int64 matrix.
+- A small fraction of very heavy raters end up with fewer distinct hard
+  negs after filtering; the script pads with duplicates and reports the
+  count.
 
-**Retraining**: same architecture, same hyperparams, but each batch
-additionally samples 1,755 items uniformly from the flattened hard-neg pool
-(~30% of negatives). The contrastive matrix becomes `4096 × 5851`.
+**Retraining**: same architecture and hyperparameters, but each training
+batch additionally samples a chunk of items uniformly from the flattened
+hard-neg pool (sized to match the doc's 70/30 in-batch/hard ratio). The
+contrastive matrix becomes `B × (B + N_hard)`; positives stay in columns
+`0..B-1` so the cross-entropy labels (`arange(B)`) remain unchanged.
 
-**Result**: Recall@10 = **3.26%** (+53% vs baseline), beating popularity at
-K=50 (tie) and K=100 (22.65% vs 21.74%).
-
-Why hard negatives fix the bias: hard negatives are sampled by similarity
-to the user, not by frequency. This decouples the negative-sampling
+**Why this fixes the bias**: hard negatives are sampled **by similarity to
+the user**, not by frequency. This decouples the negative-sampling
 distribution from `P(item)`, neutralizing the implicit `/ P(item)` term.
 
 ### Phase 6 — Error analysis ([src/error_analysis.py](src/error_analysis.py))
 
-**Cold-start bucket analysis** — Recall@10 by user train-history size:
+Three analyses are run against the final trained model:
 
-| train history | #users | mean Recall@10 |
-|---------------|-------:|---------------:|
-| 1-19          |    416 |         0.0681 |
-| 20-49         |  1,789 |         0.0526 |
-| 50-99         |  1,382 |         0.0291 |
-| 100-199       |  1,228 |         0.0182 |
-| 200-499       |    991 |         0.0101 |
-| 500+          |    234 |         0.0074 |
-
-Recall@10 *decreases* monotonically with train-history size. Two reasons
-combined:
-- **Metric-structural** — heavy raters have ~60 test items, so Recall@10 is
-  capped at `10/60 ≈ 17%`. Light raters with 2 test items can hit 100%.
-- **Model-structural** — heavy raters have diverse tastes that don't
-  compress well into a single 128-d point.
-
-**Popularity bias residual**:
-
-| | retrieved items | ground-truth items |
-|---|---:|---:|
-| median popularity rank in train | **525** | **456** |
-| mean popularity rank            | 477.5   | 433.6  |
-
-The model retrieves items that are *less popular* than what users actually
-liked — direct evidence that some popularity bias remains even after hard
-negatives. See [notebooks/popularity_histogram.png](notebooks/popularity_histogram.png)
-for the distribution overlap.
-
-**Qualitative example** (one of three from the script):
-
-> User 3939 (gt=50 items, era: 1950s–1970s classic cinema):
-> ground truth includes *Kramer Vs. Kramer (1979)*, *Doctor Zhivago (1965)*,
-> *Streetcar Named Desire (1951)*, *Midnight Cowboy (1969)*.
->
-> Top-10 from our model: *Hamlet (1990)*, *Primary Colors (1998)*,
-> *Spanish Prisoner (1997)*, *Six Degrees of Separation (1993)* — late-90s
-> indie films.
->
-> **Failure mode**: the model picked up on "drama" but missed the user's
-> strong era preference. Genre features alone don't disambiguate decade.
+1. **Cold-start bucketing** — partition test users by training-history size
+   (1–19, 20–49, …, 500+) and report mean Recall@10 per bucket. Surfaces
+   the structural and model-capacity factors that determine where the
+   model does well vs poorly.
+2. **Popularity bias residual** — compare the popularity-rank distribution
+   of *retrieved* top-K items against the popularity-rank distribution of
+   *ground-truth* test items. A right-skew of the retrieved distribution
+   indicates residual popularity bias even after hard-neg training. Output
+   saved as a density histogram at `notebooks/popularity_histogram.png`.
+3. **Qualitative examples** — for a small set of users (best-recall,
+   median-recall, zero-recall), print the model's top-10 recommendations
+   alongside their actual held-out ground truth, with movie titles. This
+   makes failure modes (era mismatch, taste-cluster confusion, etc.)
+   concrete.
 
 ---
 
@@ -240,12 +202,13 @@ for the distribution overlap.
 
 Files: [src/ranker.py](src/ranker.py), [src/train_ranker.py](src/train_ranker.py).
 The `evaluate.py` script also contains an `evaluate_ndcg()` function that
-computes NDCG@10 before and after re-ranking.
+computes NDCG@K before and after re-ranking.
 
 Design: a small MLP over `[user_emb ‖ item_emb ‖ user_emb ⊙ item_emb]`
-features (384-d → 64-d → scalar), trained with BPR loss
-`L = -log σ(score_pos - score_neg)` where negatives are sampled from each
-user's FAISS top-100 candidates.
+features, trained with BPR loss
+`L = -log σ(score_pos - score_neg)`, where negatives are sampled from each
+user's FAISS top-100 candidate set. NDCG@10 is reported on the candidate
+pool both before and after re-ranking.
 
 **Why it didn't run**: training the ranker on the same MPS context as the
 frozen two-tower model deadlocks on Python 3.13 + torch 2.12 + faiss-cpu
@@ -259,8 +222,8 @@ synchronization issue rather than a code bug.
   on 3.12 than on 3.13 as of this writing.
 - Move both towers + ranker to CPU for the ranker-training phase only.
 
-The retrieval-side narrative stands on its own; ranking would have been
-the polish step on top of an already-strong retriever.
+The retrieval-side pipeline stands on its own; ranking is a polish step on
+top of an already-strong retriever.
 
 ---
 
@@ -268,8 +231,8 @@ the polish step on top of an already-strong retriever.
 
 - **Python 3.13** (venv-isolated)
 - **PyTorch 2.12** with MPS backend (Apple Silicon)
-- **FAISS-CPU 1.14** (`IndexFlatIP` — exact inner-product search; 3,706 items
-  doesn't need ANN)
+- **FAISS-CPU 1.14** (`IndexFlatIP` — exact inner-product search; small
+  catalog doesn't need approximate nearest-neighbor)
 - **pandas / pyarrow** for parquet-backed processed splits
 - **matplotlib** for the popularity histogram
 
