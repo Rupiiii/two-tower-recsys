@@ -196,37 +196,6 @@ Three analyses are run against the final trained model:
 
 ---
 
-## Phase 4 — Pairwise BPR ranker (known issue)
-
-**Status**: implemented but not benchmarked due to an environment issue.
-
-Files: [src/ranker.py](src/ranker.py), [src/train_ranker.py](src/train_ranker.py).
-The `evaluate.py` script also contains an `evaluate_ndcg()` function that
-computes NDCG@K before and after re-ranking.
-
-Design: a small MLP over `[user_emb ‖ item_emb ‖ user_emb ⊙ item_emb]`
-features, trained with BPR loss
-`L = -log σ(score_pos - score_neg)`, where negatives are sampled from each
-user's FAISS top-100 candidate set. NDCG@10 is reported on the candidate
-pool both before and after re-ranking.
-
-**Why it didn't run**: training the ranker on the same MPS context as the
-frozen two-tower model deadlocks on Python 3.13 + torch 2.12 + faiss-cpu
-on Apple Silicon. Both pure-MPS and CPU-side-indexing variants hang at 0%
-CPU with no progress. The deadlock survives moving the ranker entirely to
-CPU while the towers stay on MPS, suggesting a shared OpenMP / MPS
-synchronization issue rather than a code bug.
-
-**Workaround paths** (untested):
-- Rebuild the venv with Python 3.12 — torch's MPS path is better-tested
-  on 3.12 than on 3.13 as of this writing.
-- Move both towers + ranker to CPU for the ranker-training phase only.
-
-The retrieval-side pipeline stands on its own; ranking is a polish step on
-top of an already-strong retriever.
-
----
-
 ## Stack
 
 - **Python 3.13** (venv-isolated)
